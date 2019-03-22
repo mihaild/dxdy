@@ -41,7 +41,7 @@ def main():
     stats.close()
 
     readme = open('README.md', 'a')
-    readme.write(f'{add} | {cur} | {sequence[cur].index} | {len(sequence) - sequence[cur].index} | {max_len}n')
+    readme.write(f'{add} | {cur} | {sequence[cur].index} | {len(sequence) - sequence[cur].index} | {max_len}\n')
     readme.close()
 
 
