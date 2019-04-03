@@ -1,6 +1,7 @@
 https://dxdy.ru/topic129325-105.html
 
 -O2
+
 i | transform q25 | transform q75 | cycle q25 | cycle q75
 --| ------------- | ------------- | --------- | ---------
 0 | 0.032 | 0.033 | 0.03 | 0.031
@@ -11,6 +12,7 @@ i | transform q25 | transform q75 | cycle q25 | cycle q75
 25 | 24703.6 | 26327.7 | 24827.4 | 25512.1
 
 -Ofast -march=native -mtune=native
+
 i | transform q25 | transform q75 | cycle q25 | cycle q75
 --| ------------- | ------------- | --------- | ---------
 0 | 0.03 | 0.031 | 0.03 | 0.03
