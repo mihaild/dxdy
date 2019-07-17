@@ -48,10 +48,8 @@ mpz_class single_line(int N, int K) {
     vector<mpz_class> cache(N + 1);
     cache[0] = 1;
     for (int k = 1; k <= K; ++k) {
-        for (int start = 0; start < k; ++start) {
-            for (int x = start + k; x <= N; x += k) {
-                cache[x] += cache[x - k];
-            }
+        for (int i = 0; i + k <= N; ++i) {
+            cache[i + k] += cache[i];
         }
     }
 
@@ -82,8 +80,8 @@ template<TCheckFunction F> std::pair<double, double> Run(int64_t N, int64_t K, i
 int main() {
 #define CHECK(func)\
     { cout << #func << ' '; auto res = Run<func>(2000, 1000, 16); cout << res.first << ' ' << res.second << endl; }
-    CHECK(naive_square);
-    CHECK(naive_square_no_extra);
+    //CHECK(naive_square);
+    //CHECK(naive_square_no_extra);
     CHECK(single_line);
     return 0;
 }
