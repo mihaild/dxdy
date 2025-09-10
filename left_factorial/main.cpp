@@ -7,6 +7,24 @@
 #define RESET   "\033[0m"
 #define BLUE    "\033[34m"      /* Blue */
 
+void process_block(const int64_t* p, int64_t* r, int64_t* s, int64_t* zeroes, size_t size) {
+    std::fill(r, r + size, 1);
+    std::fill(s, s + size, 1);
+    std::fill(zeroes, zeroes + size, 0);
+
+    size_t shift = 0;
+    for (int64_t n = 2; n < *(p + size - 1); ++n) {
+        while (p[shift] <= n) {
+            ++shift;
+        }
+        for (size_t i = shift; i < size; ++i) {
+            r[i] = (r[i] * n) % p[i];
+            s[i] = (s[i] + r[i]) % p[i];
+            zeroes[i] += s[i] == 0;
+        }
+    }
+}
+
 int main() {
     int64_t N;
     std::cin >> N;
@@ -21,9 +39,6 @@ int main() {
         }
     }
     std::cerr << "will check " << primes.size() << " primes, up to " << primes.back() << std::endl;
-    std::vector<int64_t> r(primes.size(), 1);
-    std::vector<int64_t> s(primes.size(), 1);
-    std::vector<int64_t> zeroes(primes.size(), 0);
     auto start = std::chrono::system_clock::now();
     auto last = start;
     constexpr size_t BLOCK_SIZE = 128;
@@ -35,6 +50,7 @@ int main() {
     {
         int64_t num = 0;
         const int thread_num = omp_get_thread_num();
+        std::vector<int64_t> r(BLOCK_SIZE), s(BLOCK_SIZE), zeroes(BLOCK_SIZE);
 #pragma omp for schedule(static, 1)
         for (size_t block_start = 0; block_start < primes.size(); block_start += BLOCK_SIZE) {
             if (thread_num == 0) {
@@ -49,24 +65,11 @@ int main() {
             }
 
             const size_t block_size = std::min(BLOCK_SIZE, primes.size() - block_start);
-            const size_t block_last = block_start + block_size - 1;
-            size_t block_shift = 0;
-            for (size_t n = 2; n < primes[block_last]; ++n) {
-                while (primes[block_start + block_shift] <= n) {
-                    ++block_shift;
-                }
-                for (size_t block_pos = block_shift; block_pos < block_size; ++block_pos) {
-                    const auto i = block_pos + block_start;
-                    r[i] = (r[i] * n) % primes[i];
-                    s[i] = (s[i] + r[i]) % primes[i];
-                    zeroes[i] += s[i] == 0;
-                }
-            }
-
-            for (size_t i = block_start; i <= block_last; ++i) {
-                if (s[i] == 0 || zeroes[i] >= 8) {
+            process_block(primes.data() + block_start, r.data(), s.data(), zeroes.data(), block_size);
+            for (size_t i = 0; i < block_size; ++i) {
+                if (zeroes[i] >= 7 || s[i] == 0) {
 #pragma omp critical(Write)
-                    std::cout << primes[i] << ' ' << (s[i] == 0) << ' ' << zeroes[i] << std::endl;
+                    std::cout << primes[i + block_start] << ' ' << (s[i] == 0) << ' ' << zeroes[i] << std::endl;
                 }
             }
         }
