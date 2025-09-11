@@ -75,18 +75,23 @@ __global__ void process_block_kernel(const uint64_t* p_dev, uint64_t* s_out_dev,
 
 
 int main() {
+    uint64_t start_point;
+    std::cerr << "Enter start point: ";
+    std::cin >> start_point;
     uint64_t N;
-    std::cout << "Enter the upper limit N to find primes: ";
+    std::cerr << "Enter the upper limit N to find primes: ";
     std::cin >> N;
 
     // --- Step 1: Sieve of Eratosthenes to find primes on the CPU ---
     std::vector<bool> is_prime(N, true);
     std::vector<uint64_t> primes;
     is_prime[0] = is_prime[1] = false;
-    for (int i = 2; i < N; ++i) {
+    for (uint64_t i = 2; i < N; ++i) {
         if (is_prime[i]) {
-            primes.push_back(i);
-            for (int j = i + i; j < N; j += i) {
+            if (i >= start_point) {
+                primes.push_back(i);
+            }
+            for (int j = i * i; j < N; j += i) {
                 is_prime[j] = false;
             }
         }
@@ -132,7 +137,7 @@ int main() {
         if (std::chrono::duration<double>(cur - last).count() > 10) {
             double t = std::chrono::duration<double>(cur - start).count();
             double expected_total = t / cum_sums[block_start] * cum_sums.back();
-            std::cerr << BLUE << "i=" << block_start << ", t=" << t << ", expected_total=" << expected_total << RESET << std::endl;
+            std::cerr << BLUE << "p=" << primes[block_start] << ", t=" << t << ", eta=" << (expected_total - t) << ", expected_total=" << expected_total << RESET << std::endl;
             last = cur;
         }
 
