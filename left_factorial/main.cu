@@ -1,7 +1,12 @@
 #include <iostream>
 #include <vector>
 #include <chrono>
-#include <algorithm> // For std::min
+#include <thread>
+#include <algorithm>
+#include <fstream>
+#include <csignal>
+#include <cmath>
+#include <iomanip>
 
 // CUDA runtime
 #include <cuda_runtime.h>
@@ -9,171 +14,232 @@
 #define RESET   "\033[0m"
 #define BLUE    "\033[34m"      /* Blue */
 
+// State file to store progress
+const char* PROGRESS_FILE = "prime_progress.dat";
+const char* LOG_FILE = "good_primes.log";
+
+// Global flag for graceful shutdown
+volatile bool g_keep_running = true;
+
+// --- Utility and State Management ---
+
+// Handles Ctrl+C to allow for a graceful shutdown
+void signal_handler(int signum) {
+    if (signum == SIGINT) {
+        std::cerr << "\nCaught signal " << signum << ". Shutting down gracefully..." << std::endl;
+        g_keep_running = false;
+    }
+}
+
+// Struct to hold the application's state for persistence
+struct ProgressState {
+    uint64_t first_unchecked = 0;
+    double total_duration_seconds = 0.0;
+};
+
+// Saves the current progress to the state file
+void save_progress(const ProgressState& state) {
+    std::ofstream file(PROGRESS_FILE, std::ios::binary);
+    if (file.is_open()) {
+        file.write(reinterpret_cast<const char*>(&state), sizeof(state));
+    } else {
+        std::cerr << "Error: Could not open " << PROGRESS_FILE << " for writing." << std::endl;
+    }
+}
+
+// Loads progress from the state file. If not found, returns a default state.
+ProgressState load_progress() {
+    ProgressState state;
+    std::ifstream file(PROGRESS_FILE, std::ios::binary);
+    if (file.is_open()) {
+        file.read(reinterpret_cast<char*>(&state), sizeof(state));
+        std::cerr << "Resuming progress. First unchecked: " << state.first_unchecked
+                  << ", Total time so far: " << state.total_duration_seconds << "s." << std::endl;
+    } else {
+        std::cerr << "No progress file found. Starting from scratch." << std::endl;
+    }
+    return state;
+}
+
 // Macro for checking CUDA errors
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-   if (code != cudaSuccess)
-   {
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
+    if (code != cudaSuccess) {
+        fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+        if (abort) exit(code);
+    }
 }
+
+std::vector<uint64_t> generate_primes(const std::vector<uint64_t>& base_primes, uint64_t lower_bound, uint64_t upper_bound) {
+    std::vector<bool> is_prime(upper_bound - lower_bound, true);
+    for (const uint64_t p : base_primes) {
+        if (p * p > upper_bound) {
+            break;
+        }
+        for (uint64_t j = std::max(p * p, (lower_bound + p - 1) / p * p); j < upper_bound; j += p) {
+            is_prime[j - lower_bound] = false;
+        }
+    }
+    std::vector<uint64_t> result;
+    for (uint64_t i = 0; i < is_prime.size(); ++i) {
+        if (is_prime[i]) {
+            result.push_back(i + lower_bound);
+        }
+    }
+    return result;
+}
+
+
+// --- CUDA Kernel ---
 
 /**
  * @brief CUDA kernel to process a block of prime numbers.
- * * Each GPU thread processes one prime number independently. The loop for 'n' for each prime 'p'
- * runs from 2 up to p-1. This is an optimization over the original CPU code, as any
- * calculations for n >= p do not change the final result.
- * * @param p_dev         Device pointer to the array of primes in the current block.
- * @param s_out_dev     Device pointer to store the final 's' value for each prime.
+ * Each GPU thread processes one prime number independently.
+ * @param p_dev          Device pointer to the array of primes in the current block.
+ * @param s_out_dev      Device pointer to store the final 's' value for each prime.
  * @param zeroes_out_dev Device pointer to store the count of 'zeroes' for each prime.
- * @param block_size    The number of primes in the current block.
+ * @param block_size     The number of primes in the current block.
  */
 __global__ void process_block_kernel(const uint64_t* p_dev, uint64_t* s_out_dev, int* zeroes_out_dev, size_t block_size) {
-    // Calculate the global thread ID
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= block_size) return;
 
-    // Boundary check to ensure we don't process out of bounds
-    if (i >= block_size) {
-        return;
-    }
-
-    // Get the prime number for this thread
     uint64_t p = p_dev[i];
-
-    // Local variables for the calculation
     uint64_t r = 1;
     uint64_t s = 1;
     int zeroes = 0;
 
-    // The main computation loop for the prime 'p'.
-    // We calculate s = (1! + 2! + ... + (p-1)!) mod p
+    // Use fast modular multiplication for (r * n) % p
     __int128 m = uint64_t(-1) / p;
     for (uint64_t n = 2; n < p; ++n) {
-        // r becomes n! mod p
-        //r = (r * n) % p;
-
         r = r * n;
         uint64_t q = (m * r) >> 64;
         uint64_t t = r - q * p;
         r = t - p * (t >= p);
-        // s becomes the cumulative sum of factorials mod p
         s += r;
-        if (s >= p) {
-            s -= p;
-        }
+        if (s >= p) s -= p;
+
         if (s == 0) {
             zeroes++;
         }
     }
 
-    // Store the final results back into global memory
     s_out_dev[i] = s;
     zeroes_out_dev[i] = zeroes;
 }
 
+// --- Main Application Logic ---
 
 int main() {
-    uint64_t start_point;
-    std::cerr << "Enter start point: ";
-    std::cin >> start_point;
-    uint64_t N;
-    std::cerr << "Enter the upper limit N to find primes: ";
-    std::cin >> N;
+    // Register signal handler for graceful shutdown
+    signal(SIGINT, signal_handler);
 
-    // --- Step 1: Sieve of Eratosthenes to find primes on the CPU ---
-    std::vector<bool> is_prime(N, true);
-    std::vector<uint64_t> primes;
-    is_prime[0] = is_prime[1] = false;
-    for (uint64_t i = 2; i < N; ++i) {
-        if (is_prime[i]) {
-            if (i >= start_point) {
-                primes.push_back(i);
-            }
-            for (int j = i * i; j < N; j += i) {
-                is_prime[j] = false;
+    // Load previous state or start new
+    ProgressState state = load_progress();
+    auto session_start_time = std::chrono::steady_clock::now();
+
+    // Open log file in append mode
+    std::ofstream log_file(LOG_FILE, std::ios_base::app);
+    if (!log_file.is_open()) {
+        std::cerr << "Error: Could not open log file " << LOG_FILE << std::endl;
+        return 1;
+    }
+
+    // Segment size for generating primes. Tune for performance vs. memory.
+    const uint64_t SEGMENT_SIZE = 1024 * 1024 * 4;
+
+    const uint64_t BASE_PRIMES = 1000000;
+    std::vector<uint64_t> base_primes;
+    {
+        std::vector<bool> is_prime(BASE_PRIMES, true);
+        for (uint64_t p = 2; p < BASE_PRIMES; ++p) {
+            if (is_prime[p]) {
+                base_primes.push_back(p);
+                for (uint64_t j = p * p; j < BASE_PRIMES; j += p) {
+                    is_prime[j] = false;
+                }
             }
         }
     }
 
-    if (primes.empty()) {
-        std::cerr << "No primes found up to " << N << std::endl;
-        return 1;
-    }
-    std::cerr << "Will check " << primes.size() << " primes, up to " << primes.back() << std::endl;
-
-    // --- Step 2: Set up for block processing and CUDA ---
-    auto start = std::chrono::system_clock::now();
-    auto last = start;
-
-    // Size of blocks to process on the GPU at a time. Tune for performance.
-    constexpr size_t BLOCK_SIZE = 1024 * 128;
-
-    // For progress reporting
-    std::vector<uint64_t> cum_sums(primes);
-    for (size_t i = 1; i < cum_sums.size(); ++i) {
-        cum_sums[i] += cum_sums[i - 1];
-    }
-
-    // Host vectors to hold results from the GPU for one block
-    std::vector<uint64_t> s_host(BLOCK_SIZE);
-    std::vector<int> zeroes_host(BLOCK_SIZE);
-
-    // Device pointers
     uint64_t* p_dev = nullptr;
     uint64_t* s_dev = nullptr;
     int* zeroes_dev = nullptr;
 
-    // Allocate memory on the GPU for one block
-    gpuErrchk(cudaMalloc(&p_dev, BLOCK_SIZE * sizeof(uint64_t)));
-    gpuErrchk(cudaMalloc(&s_dev, BLOCK_SIZE * sizeof(uint64_t)));
-    gpuErrchk(cudaMalloc(&zeroes_dev, BLOCK_SIZE * sizeof(int)));
+    gpuErrchk(cudaMalloc(&p_dev, SEGMENT_SIZE * sizeof(uint64_t)));
+    gpuErrchk(cudaMalloc(&s_dev, SEGMENT_SIZE * sizeof(uint64_t)));
+    gpuErrchk(cudaMalloc(&zeroes_dev, SEGMENT_SIZE * sizeof(int)));
 
-    // --- Step 3: Main loop to process primes in blocks ---
-    for (size_t block_start = 0; block_start < primes.size(); block_start += BLOCK_SIZE) {
-        // Progress reporting (similar to the original)
-        auto cur = std::chrono::system_clock::now();
-        if (std::chrono::duration<double>(cur - last).count() > 10) {
-            double t = std::chrono::duration<double>(cur - start).count();
-            double expected_total = t / cum_sums[block_start] * cum_sums.back();
-            std::cerr << BLUE << "p=" << primes[block_start] << ", t=" << t << ", eta=" << (expected_total - t) << ", expected_total=" << expected_total << RESET << std::endl;
-            last = cur;
+    // --- Main processing loop ---
+    while (g_keep_running) {
+        uint64_t lower_bound = state.first_unchecked;
+        uint64_t upper_bound = state.first_unchecked + SEGMENT_SIZE;
+        if (upper_bound >= BASE_PRIMES * BASE_PRIMES) {
+            std::cerr << "Not enough primes precalculated" << std::endl;
+            std::terminate();
         }
 
-        const size_t current_block_size = std::min(BLOCK_SIZE, primes.size() - block_start);
+        std::vector<uint64_t> primes_to_check = generate_primes(base_primes, lower_bound, upper_bound);
 
-        // Copy current block of primes from host to device
-        gpuErrchk(cudaMemcpy(p_dev, primes.data() + block_start, current_block_size * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        if (primes_to_check.empty()) {
+            state.first_unchecked = upper_bound; // Skip empty segments
+            continue;
+        }
 
-        // Configure and launch the CUDA kernel
+        std::cerr << BLUE << "Checking " << primes_to_check.size() << " primes in range ["
+                  << primes_to_check.front() << ", " << primes_to_check.back() << "]" << RESET << std::endl;
+
+        // --- CUDA Processing for the current segment ---
+        size_t num_primes = primes_to_check.size();
+        std::vector<uint64_t> s_host(num_primes);
+        std::vector<int> zeroes_host(num_primes);
+
+        gpuErrchk(cudaMemcpy(p_dev, primes_to_check.data(), num_primes * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
         const int threads_per_block = 256;
-        const int blocks_per_grid = (current_block_size + threads_per_block - 1) / threads_per_block;
-        process_block_kernel<<<blocks_per_grid, threads_per_block>>>(p_dev, s_dev, zeroes_dev, current_block_size);
-
-        // Check for any errors during kernel launch
+        const int blocks_per_grid = (num_primes + threads_per_block - 1) / threads_per_block;
+        process_block_kernel<<<blocks_per_grid, threads_per_block>>>(p_dev, s_dev, zeroes_dev, num_primes);
         gpuErrchk(cudaGetLastError());
-        // Wait for the kernel to complete
         gpuErrchk(cudaDeviceSynchronize());
 
-        // Copy results from device back to host
-        gpuErrchk(cudaMemcpy(s_host.data(), s_dev, current_block_size * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-        gpuErrchk(cudaMemcpy(zeroes_host.data(), zeroes_dev, current_block_size * sizeof(int), cudaMemcpyDeviceToHost));
+        gpuErrchk(cudaMemcpy(s_host.data(), s_dev, num_primes * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        gpuErrchk(cudaMemcpy(zeroes_host.data(), zeroes_dev, num_primes * sizeof(int), cudaMemcpyDeviceToHost));
 
-        // Process results on the CPU
-        for (size_t i = 0; i < current_block_size; ++i) {
+        // --- Process and Log Results ---
+        for (size_t i = 0; i < num_primes; ++i) {
             if (zeroes_host[i] >= 8 || s_host[i] == 0) {
-                std::cout << primes[i + block_start] << ' ' << (s_host[i] == 0) << ' ' << zeroes_host[i] << std::endl;
+                std::stringstream ss;
+                ss << primes_to_check[i] << ' ' << (s_host[i] == 0) << ' ' << zeroes_host[i] << std::endl;
+                std::cout << ss.str(); // Log to stdout
+                log_file << ss.str();  // Log to file
             }
         }
+        log_file.flush();
+
+        // Update state for the next iteration
+        state.first_unchecked = upper_bound;
+        auto now = std::chrono::steady_clock::now();
+        double session_elapsed = std::chrono::duration<double>(now - session_start_time).count();
+        state.total_duration_seconds += session_elapsed;
+        session_start_time = now;
+
+        save_progress(state);
+        std::cerr << BLUE << "Progress Update: first unchecked: " << state.first_unchecked
+                  << ". Total time: " << std::fixed << std::setprecision(2) << state.total_duration_seconds << "s." << RESET << std::endl;
     }
 
-    // --- Step 4: Cleanup ---
     gpuErrchk(cudaFree(p_dev));
     gpuErrchk(cudaFree(s_dev));
     gpuErrchk(cudaFree(zeroes_dev));
 
-    std::cout << "total time " << std::chrono::duration<double>(std::chrono::system_clock::now() - start).count() << std::endl;
+    // Final save before exiting
+    auto final_time = std::chrono::steady_clock::now();
+    state.total_duration_seconds += std::chrono::duration<double>(final_time - session_start_time).count();
+    save_progress(state);
+
+    std::cout << "Application finished. Total time spent across all sessions: "
+              << state.total_duration_seconds << " seconds." << std::endl;
+
     return 0;
 }
 
